@@ -1,0 +1,607 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Getopt::Long;
+use Cwd;
+
+# This script reads paired-end alignments, and extracts the first 50bp of both Read 1 and Read 2 sequences (Read 2 is reverse-complemented first).
+# Aligments are considered duplicates if both sequences are found more than once (perfect matches of sequence1:sequence2). Only a single paired-end
+# alignment for the same sequence1:sequence2 combination is written out irrespective of the mapping position. De-duplication based on mapping position
+# can then be carried out downstream, e.g. within SeqMonk.
+
+# Please note that this script only works for paired-end files for the eccSeq manuscript, and is not intended as a general all-purpose deduplication tool.
+
+my $dedup_version = 'v0.1.0';
+my @filenames;
+
+my %seqs; # also using sequences
+my ($single,$paired,$global_single,$global_paired,$samtools_path,$bam,$rrbs,$multiple,$output_dir,$outfile) = process_commandline();
+
+###########################
+### START OF PROCESSING ###
+###########################
+    
+foreach my $file (@filenames){
+
+    if ($global_single){
+		$paired = 0;
+		$single = 1;
+    }
+    elsif($global_paired){
+		$paired = 1;
+		$single = 0;
+    }
+
+    # Testing if the file appears to be truncated, in which case we bail with a big scary warning message
+    if ($file =~ /(\.bam$)/){
+		bam_isTruncated($file);
+    }
+    
+    unless($global_single or $global_paired){
+	
+		warn "Trying to determine the type of mapping from the SAM header line\n"; sleep(1);
+	
+		### if the user did not specify whether the alignment file was single-end or paired-end we are trying to get this information from the @PG header line in the SAM/BAM file
+		if ($file =~ /\.gz$/){
+			open (DETERMINE,"gunzip -c $file |") or die "Unable to read from gzipped file $file: $!\n";
+		}
+		elsif ($file =~ /\.bam$/){
+			open (DETERMINE,"$samtools_path view -h $file |") or die "Unable to read from BAM file $file: $!\n";
+		}
+		else{
+			open (DETERMINE,$file) or die "Unable to read from $file: $!\n";
+		}
+		while (<DETERMINE>){
+			last unless (/^\@/);
+			if ($_ =~ /^\@PG/){
+				# warn "found the \@PG line:\n";
+				# warn "$_";
+				
+				if ($_ =~ /\s+--?1\s+/ and $_ =~ /\s+--?2\s+/){ # allowing -1 and -2 or --1 and --2
+					warn "Treating file as paired-end data (extracted from \@PG line)\n"; sleep(1);
+					$paired = 1;
+					$single = 0;
+				}
+				else{
+					warn "Treating file as single-end data (extracted from \@PG line)\n"; sleep(1);
+					$paired = 0;
+					$single = 1;
+				}
+			}
+		}
+		close DETERMINE or warn "$!\n";
+	}
+    
+    if ($file =~ /(\.bam$|\.sam$)/){
+		bam_isEmpty($file);
+    }
+    
+    ### OPTIONS
+    unless ($single or $paired){
+		die "Please specify either -s (single-end) or -p (paired-end) for deduplication, or provide a SAM/BAM file that contains the \@PG header line\n\n";
+    }
+
+    unless ($paired){
+	die "This is a purpose-written script for the eccDNA project, which only works for paired-end files. Please stop using it for non paired-end files.\n";
+    }
+    ### 
+    if ($paired){
+	test_positional_sorting($file);
+    }
+    
+
+    ### writing to a report file
+    my $report = $file;
+    # now would be a good time to get rid of the path information
+    $report =~ s/.*\///; # removing path information
+    # warn "Now: $report\n";
+    $report =~ s/\.gz$//;
+    $report =~ s/\.sam$//;
+    $report =~ s/\.bam$//;
+    $report =~ s/\.txt$//;
+    $report =~ s/$/.deduplication_report.txt/;
+
+    open (REPORT,'>',"${output_dir}$report") or die "Failed to write to report file to ${output_dir}$report: $!\n\n";
+
+
+ 
+ 	my $header_printed = 0;
+	my %unique_seqs;
+	my %positions;
+	
+	if ($file =~ /\.gz$/){
+			open (IN,"gunzip -c $file |") or die "Unable to read from gzipped file $file: $!\n";
+	}
+	elsif ($file =~ /\.bam$/){
+			open (IN,"$samtools_path view -h $file |") or die "Unable to read from BAM file $file: $!\n";
+	}
+	else{
+		open (IN,$file) or die "Unable to read from $file: $!\n";
+	}
+	
+	
+	if (defined $outfile){ # user-defined output filename
+		# using that name
+	}
+	else{ # deriving the name from the input file automatically (default)
+		$outfile = $file;
+	}
+	
+	# now would be a good time to get rid of the path information
+	$outfile =~ s/.*\///; # removing path information
+
+	$outfile =~ s/\.gz$//;
+	$outfile =~ s/\.sam$//;
+	$outfile =~ s/\.bam$//;
+	$outfile =~ s/\.txt$//;
+
+	if ($bam == 1){
+		$outfile =~ s/$/.deduplicated.bam/;
+	}
+	elsif ($bam == 2){
+		$outfile =~ s/$/.deduplicated.sam.gz/;
+	}
+	else{
+		$outfile =~ s/$/.deduplicated.sam/;
+	}
+
+	if ($multiple){
+		$outfile =~ s/deduplicated/multiple.deduplicated/;
+	}
+
+	warn "Output file is: $outfile\n\n";
+
+	if ($bam == 1){
+		open (OUT,"| $samtools_path view -bS - > ${output_dir}$outfile") or die "Failed to write to ${output_dir}$outfile: $!\n";
+	}
+	elsif($bam == 2){ ### no Samtools found on system. Using GZIP compression instead
+		open (OUT,"| gzip -c - > ${output_dir}$outfile") or die "Failed to write to ${output_dir}$outfile: $!\n";
+	}
+	else{
+		open (OUT,'>',"${output_dir}$outfile") or die "Unable to write to ${output_dir}$outfile: $!\n";
+	}
+
+	my $count = 0;
+	my $unique_seqs = 0;
+	my $removed = 0;
+
+	my $index = 0; # will use 0 as forward alignment, and 1 as reverse alignment
+	# at the moment irrelevant
+
+	while (<IN>){
+
+		### if this was a SAM file we ignore header lines
+		if (/^\@\w{2}\t/){
+			print "skipping header line:\t$_";
+		
+			# Printing the header lines again into the de-duplicated file
+			print OUT "$_";
+			next;
+		}
+	
+		# we can assume that once we reach sequence entries we have passed the header section of the first file
+		++$header_printed;
+		++$count;
+		my $composite; # storing positional data. For single end data we are only using the start coordinate since the end might have been trimmed to different lengths
+
+		my ($strand,$chr,$start,$end,$cigar,$seq,$seq2);
+		my $line1 = $_;
+		($strand,$chr,$start,$cigar,$seq) = (split (/\t/))[1,2,3,5,9]; # we are assigning the FLAG value to $strand
+		
+		### reading in the next line
+		$_ = <IN>;
+		$seq2 = (split (/\t/))[9];
+		
+		# reverse complement Sequence 2
+		# warn "$seq\n$seq2\n";
+
+		$seq2 = reverse$seq2;   # reversing seq2
+		$seq2 =~ tr/GATC/CTAG/; # complementing
+		# warn "$seq2\n";
+
+		$seq  = substr($seq,0,50);
+		$seq2 = substr($seq2,0,50);
+		# warn "$seq\n$seq2\n~~~~~~~\n\n"; sleep(1);
+		
+		if (exists $seqs{"$seq:$seq2"}){
+			++$removed;
+		}
+		else{
+			if ($paired){
+				print OUT "$line1"; # printing first paired-end line for SAM output
+			}
+			print OUT "$_"; # printing single-end SAM alignment or second paired-end line
+			$seqs{"$seq:$seq2"}++;
+		}
+	}
+
+	my $percentage;
+	my $percentage_leftover;
+	my $leftover = $count - $removed;
+
+	unless ($count == 0){
+		$percentage = sprintf("%.2f",$removed/$count*100);
+		$percentage_leftover = sprintf("%.2f",$leftover/$count*100);
+	}
+	else{
+		$percentage = 'N/A';
+		$percentage_leftover = 'N/A';
+	}
+
+	warn "\nTotal number of alignments analysed in $file:\t$count\n";
+	warn "Total number duplicated alignments removed:\t$removed ($percentage%)\n";
+	warn "Duplicated alignments were found at:\t",scalar keys %positions," different position(s)\n\n";
+	warn "Total count of deduplicated leftover sequences: $leftover ($percentage_leftover% of total)\n\n";
+
+	print REPORT "\nTotal number of alignments analysed in $file:\t$count\n";
+	print REPORT "Total number duplicated alignments removed:\t$removed ($percentage%)\n";
+	print REPORT "Duplicated alignments were found at:\t",scalar keys %positions," different position(s)\n\n";
+	print REPORT "Total count of deduplicated leftover sequences: $leftover ($percentage_leftover% of total)\n\n";
+
+
+	close OUT or warn "Failed to close output filehandle: $!\n";
+	close REPORT or warn "Failed to close report filehandle: $!\n";
+	
+	
+}
+
+
+sub bam_isEmpty{
+      
+    my $file = shift;
+
+    if ($file =~ /\.bam$/){
+		open (EMPTY,"$samtools_path view $file |") or die "Unable to read from BAM file $file: $!\n";
+    }
+    else{
+		open (EMPTY,$file) or die "Unable to read from $file: $!\n";
+    }
+    my $count = 0;
+    while (<EMPTY>){
+		if ($_){
+			$count++;  # file contains data, fine.
+		}
+		last; # one line is enough
+    }
+
+    if ($count == 0){
+		die "\n### File appears to be empty, terminating deduplication process. Please make sure the input file has not been truncated. ###\n\n";
+    }
+    close EMPTY or warn "$!\n";
+}
+
+sub bam_isTruncated{
+    
+    my $file = shift;
+    warn "Checking file >>$file<< for signs of file truncation...\n";
+    
+    open (TRUNC,"$samtools_path view 2>&1 $file |") or die "Unable to read from BAM file $file: $!\n"; # 2>&1 redirects stderr to stdout, so we should be able to capture problems
+    
+    my $count = 0;
+    while (<TRUNC>){
+		chomp;
+		++$count;
+		# errors tend to start with a [], I have seen e.g.: 
+		# [W::bam_hdr_read] EOF marker is absent. The input is probably truncated.
+		if ($_ =~ /^\[/){ 
+			if ($_ =~ /[EOF|truncated]/){ 
+				die "Captured error message: '$_'\n\n[ERROR] The file appears to be truncated, please ensure that there were no errors while copying the file!!! Exiting...\n\n";
+			}
+		}
+		last if ($count == 10); 	# this should be enough
+    }
+    close TRUNC or warn "$!\n";
+}
+
+
+sub print_helpfile{
+	print "\n",'='x111,"\n";
+	print "\nThis script is supposed to remove duplicate alignments from paired-end BAM files which share\nthe very same sequence at the first 50bp of both Read 1 and Read 2\n\n";
+	
+	print '='x111,"\n\n";
+	print ">>> USAGE: ./deduplicate_by_sequence filename(s) <<<\n\n";
+
+	print "--samtools_path [path]\tThe path to your Samtools installation, e.g. /home/user/samtools/. Does not need to be specified\n\t\t\texplicitly if Samtools is in the PATH already\n\n";
+	print "--version\t\tPrint version information and exit\n";
+	
+	print '='x111,"\n\n";
+
+	print "This script was last modified on 16-09-2019\n\n";
+}
+
+
+
+
+sub test_positional_sorting{
+
+	my $filename = shift;
+
+	print "\nNow testing BAM file $filename for positional sorting (which would be bad...)\t";
+	sleep(1);
+
+	if ($filename =~ /\.gz$/) {
+		open (TEST,"gunzip -c $filename |") or die "Can't open gzipped file $filename: $!\n";
+	}
+	elsif ($filename =~ /bam$/ ||  isBam($filename) ){ ### this would allow to read BAM files that do not end in *.bam
+		if ($samtools_path){
+			open (TEST,"$samtools_path view -h $filename |") or die "Can't open BAM file $filename: $!\n";
+		}
+		else{
+			die "Sorry couldn't find an installation of Samtools. Either specifiy an alternative path using the option '--samtools_path /your/path/', or use a SAM file instead\n\n";
+		}
+	}
+	else {
+		open (TEST,$filename) or die "Can't open file $filename: $!\n";
+	}
+
+	my $count = 0;
+
+	while (<TEST>) {
+		if (/^\@/) {	     # testing header lines if they contain the @SO flag (for being sorted)
+			if (/^\@SO/) {
+				die "SAM/BAM header line '$_' indicates that the BAM alignment file has been sorted by chromosomal positions which is is incompatible with correct methylation extraction. Please use an unsorted file instead (e.g. use samtools sort -n)\n\n";
+			}
+			next;
+		}
+		$count++;
+
+		last if ($count > 100000); # else we test the first 100000 sequences if they start with the same read ID
+
+		my ($id_1) = (split (/\t/));
+
+		### reading the next line which should be read 2
+		$_ = <TEST>;
+		my ($id_2) = (split (/\t/));
+		last unless ($id_2);
+		++$count;
+	
+		if ($id_1 eq $id_2){
+			### ids are the same
+			next;
+		}
+		else{ ### in previous versions of Bismark we appended /1 and /2 to the read IDs for easier eyeballing which read is which. These tags need to be removed first
+			my $id_1_trunc = $id_1;
+			$id_1_trunc =~ s/\/1$//;
+			my $id_2_trunc = $id_2;
+			$id_2_trunc =~ s/\/2$//;
+
+			unless ($id_1_trunc eq $id_2_trunc){
+				die "\nThe IDs of Read 1 ($id_1) and Read 2 ($id_2) are not the same. This might be a result of sorting the paired-end SAM/BAM files by chromosomal position which is not compatible with correct methylation extraction. Please use an unsorted file instead (e.g. use samtools sort -n)\n\n";
+			}
+		}
+	}
+	#  close TEST or die $!; somehow fails on our cluster...
+	### If it hasen't died so far then it seems the file is in the correct Bismark format (read 1 and read 2 of a pair directly following each other)
+	warn "...passed!\n";
+	
+}
+
+sub isBam{
+
+	my $filename = shift;
+
+	# reading the first line of the input file to see if it is a BAM file in disguise (i.e. a BAM file that does not end in *.bam which may be produced by Galaxy)
+	open (DISGUISE,"gunzip -c $filename |") or die "Failed to open filehandle DISGUISE for $filename\n\n";
+
+	### when BAM files read through a gunzip -c stream they start with BAM...
+	my $bam_in_disguise = <DISGUISE>;
+	# warn "BAM in disguise: $bam_in_disguise\n\n";
+
+	if ($bam_in_disguise){
+		if ($bam_in_disguise =~ /^BAM/){
+			close (DISGUISE) or warn "Had trouble closing filehandle BAM in disguise: $!\n";
+			return 1;
+		}
+		else{
+			close (DISGUISE) or warn "Had trouble closing filehandle BAM in disguise: $!\n";
+			return 0;
+		}
+	}
+	else{
+		close (DISGUISE) or warn "Had trouble closing filehandle BAM in disguise: $!\n";
+		return 0;
+	}
+}
+
+sub process_commandline{
+
+    my $help;
+    my $representative;
+    my $single;
+    my $paired;
+    my $global_single;
+    my $global_paired;
+    my $samtools_path;
+    my $bam;
+	my $sam;
+    my $rrbs;
+    my $version;
+    my $multiple; # for multiple input files for the same sample
+    my $output_dir;
+	my $outfile;
+	
+    my $command_line = GetOptions ('help'                => \$help,
+				   'representative'      => \$representative,
+				   's|single'            => \$global_single,
+				   'p|paired'            => \$global_paired,
+				   'samtools_path=s'     => \$samtools_path,
+				   'bam'                 => \$bam,
+				   'sam'                 => \$sam,
+				   'barcode'             => \$rrbs,
+				   'version'             => \$version,
+				   'multiple'            => \$multiple, 
+				   'output_dir=s'        => \$output_dir,
+				   'o|outfile=s'         => \$outfile,
+	);
+
+    die "Please respecify command line options\n\n" unless ($command_line);
+
+    if ($help){
+		print_helpfile();
+		exit;
+    }
+
+
+
+    if ($version){
+		print << "VERSION";
+
+        Paired-end deduplication by 5' sequence
+      Felix Krueger, Babraham Bioinformatics, 2019
+	  
+	  
+VERSION
+	  exit;
+    }
+
+    ### PARENT DIRECTORY
+    my $parent_dir = getcwd();
+	unless ($parent_dir =~ /\/$/){
+		$parent_dir =~ s/$/\//;
+    }
+
+    ### OUTPUT DIRECTORY
+    if (defined $output_dir){
+		unless ($output_dir eq ''){
+			unless ($output_dir =~ /\/$/){
+				$output_dir =~ s/$/\//;
+			}
+			
+			if (chdir $output_dir){
+				$output_dir = getcwd(); #  making the path absolute
+				unless ($output_dir =~ /\/$/){
+					$output_dir =~ s/$/\//;
+				}
+			}
+			else{
+				mkdir $output_dir or die "Unable to create directory $output_dir $!\n";
+				warn "Output directory $output_dir doesn't exist, creating it for you...\n\n"; sleep(1);
+				chdir $output_dir or die "Failed to move to $output_dir\n";
+				$output_dir = getcwd(); #  making the path absolute
+				unless ($output_dir =~ /\/$/){
+					$output_dir =~ s/$/\//;
+				}
+			}
+			warn "Output will be written into the directory: $output_dir\n";
+		}
+    }
+    else{
+		$output_dir = '';
+    }
+
+    # Changing back to parent directory
+    chdir $parent_dir or die "Failed to move to $parent_dir\n";
+
+    @filenames = @ARGV;
+    unless (@filenames){
+		print "Please provide one or more Bismark output files for deduplication\n\n";
+		sleep (1);
+		print_helpfile();
+		exit;
+    }
+
+	### Ensuring that there is only a single input file if --outfile
+	if (defined $outfile){
+		
+		if ($multiple){
+			# potentially fine (see below). Several output files will get written to a single, pre-specified output file
+		}
+		else{		
+			if (scalar @filenames == 1){
+				# fine
+			}
+			else{
+				die "\nYou can only specify an output filename if a single input file was given (you supplied ",scalar @filenames," input files. Please re-specify!\n\n";
+			}
+		}
+		warn "Output filename was given as: $outfile\n";
+	}	
+
+    ### representative mode is no longer available
+    if($representative){
+		die "Deduplication in '--representative' mode is no longer supported. Please stop wanting that.\n";
+    }
+    # ensuring we have at least 2 files
+    if ($multiple){
+		unless(scalar @filenames > 1){
+			die "Please supply 2 or more files when using '--multiple'\n";	
+		}
+		if ($rrbs){
+			die "The option --multiple is currently only working in default (= random alignment) mode\n\n";
+		}
+    }
+
+    ### OPTIONS
+    unless ($global_single or $global_paired){
+		warn "\nNeither -s (single-end) nor -p (paired-end) selected for deduplication. Trying to extract this information for each file separately from the \@PG line of the SAM/BAM file\n";
+    }
+
+    if ($global_paired){
+		if ($global_single){
+			die "Please select either -s for single-end files or -p for paired-end files, but not both at the same time!\n\n";
+		}
+		warn "Processing paired-end Bismark output file(s) (SAM format):\n";
+		warn join ("\t",@filenames),"\n\n";
+	}
+    else{
+	    warn "Processing single-end Bismark output file(s) (SAM format):\n";
+	    warn join ("\t",@filenames),"\n\n";
+	}
+    
+
+    ### PATH TO SAMTOOLS
+    if (defined $samtools_path){
+		# if Samtools was specified as full command
+		if ($samtools_path =~ /samtools$/){
+			if (-e $samtools_path){
+				# Samtools executable found
+			}
+			else{
+				die "Could not find an installation of Samtools at the location $samtools_path. Please respecify\n";
+			}
+		}
+		else{
+			unless ($samtools_path =~ /\/$/){
+				$samtools_path =~ s/$/\//;
+			}
+			$samtools_path .= 'samtools';
+			if (-e $samtools_path){
+				# Samtools executable found
+			}
+			else{
+				die "Could not find an installation of Samtools at the location $samtools_path. Please respecify\n";
+			}
+		}
+    }
+    # Check whether Samtools is in the PATH if no path was supplied by the user
+    else{
+		if (!system "which samtools >/dev/null 2>&1"){ # STDOUT is binned, STDERR is redirected to STDOUT. Returns 0 if Samtools is in the PATH
+			$samtools_path = `which samtools`;
+			chomp $samtools_path;
+		}
+    }
+	
+	### Making --bam mode the default (07 03 2019)
+	if ($sam){
+		$bam = 0;
+	}
+	else{
+		$bam = 1;
+	}
+	
+    if ($bam){
+		if (defined $samtools_path){
+			$bam = 1;
+		}
+		else{
+			warn "No Samtools found on your system, writing out a gzipped SAM file instead\n";
+			$bam = 2;
+		}
+    }
+    
+    return ($single,$paired,$global_single,$global_paired,$samtools_path,$bam,$rrbs,$multiple,$output_dir,$outfile);
+}
+
+
+
+
